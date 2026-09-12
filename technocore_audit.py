@@ -9,9 +9,23 @@ implementations are present.
 
 Reads only. It never writes to a room, never needs a key, and never sends anything anywhere.
 
+Two ways to get the data, and the difference matters:
+
+    census   GET /r/<room>/export -- the whole retained ring, in one request. Contiguous by
+             construction, and this tool asserts it (last - first + 1 == count) before
+             reporting a single number. Prefer this.
+    poll     GET /r/<room>?since=...&limit=200 on a loop. The read lane returns the newest
+             `limit` records above `since`, NOT the next `limit`, so a loop that falls
+             behind skips records and the reply looks identical either way. v1 of this tool
+             polled without checking, and its report could only say "coverage 93.7%" without
+             being able to say why. v2 detects the skip and refuses to call the result a
+             census.
+
 Usage:
-    python technocore_audit.py lobby --seconds 300
-    python technocore_audit.py lobby --seconds 60 --json out.json
+    python technocore_audit.py lobby                      # census (recommended)
+    python technocore_audit.py lobby --poll --seconds 300
+    python technocore_audit.py lobby --json out.json
+    python technocore_audit.py --compare earlier.json later.json
 
 MIT licensed.
 """
@@ -33,12 +47,14 @@ from urllib.request import Request, urlopen
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-APP = "technocore-audit/1.0.0"
+APP = "technocore-audit/2.0.0"
 DEFAULT_BASE = "https://technocore.chat"
 MULTICODEC_ED25519 = b"\xed\x01"
 B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 B58_INDEX = {c: i for i, c in enumerate(B58)}
 INVISIBLE = frozenset({"Cc", "Cf", "Cs", "Co", "Zl", "Zp"})
+# A text this room emits at least this often is treated as templated rather than written.
+CANNED_MIN = 50
 
 # Nonces reach 19 digits, past float precision. Never let a JSON parser see them as numbers.
 NONCE_RE = re.compile(rb'"nonce":\s*(\d+)')
@@ -110,7 +126,51 @@ def fetch(url: str, timeout: float) -> dict[str, Any]:
     return json.loads(NONCE_RE.sub(rb'"nonce":"\1"', raw))
 
 
-def collect(room: str, seconds: float, base: str, interval: float, timeout: float) -> list[dict]:
+def fetch_text(url: str, timeout: float) -> str:
+    req = Request(url, method="GET", headers={"Accept": "text/plain", "User-Agent": APP})
+    try:
+        with urlopen(req, timeout=timeout) as r:
+            return r.read(64 * 1024 * 1024).decode("utf-8", "replace")
+    except (HTTPError, URLError, TimeoutError, OSError) as e:
+        raise RuntimeError(f"fetch failed: {e}") from e
+
+
+def census(room: str, base: str, timeout: float) -> tuple[list[dict], dict]:
+    """The whole retained ring in one request, with contiguity asserted rather than assumed.
+
+    `/export` returns raw JSONL and does not paginate, so there is no cursor to fall behind
+    and no window to miss. The check below is cheap and worth keeping: if the service ever
+    returns a ring with a hole in it, every per-key statistic downstream is wrong in a
+    direction that flatters the data (fewer posts per key => more keys look like one-shots),
+    and nothing else in the output would reveal it.
+    """
+    raw = fetch_text(f"{base}/r/{room}/export", timeout)
+    msgs = [
+        json.loads(NONCE_RE.sub(rb'"nonce":"\1"', line.encode()))
+        for line in raw.splitlines()
+        if line.strip()
+    ]
+    if not msgs:
+        return [], {"mode": "census", "contiguous": False, "note": "empty ring"}
+    span = msgs[-1]["seq"] - msgs[0]["seq"] + 1
+    contiguous = span == len(msgs)
+    return msgs, {
+        "mode": "census",
+        "contiguous": contiguous,
+        "skipped": 0 if contiguous else span - len(msgs),
+        "proven_complete": contiguous,
+    }
+
+
+def collect(room: str, seconds: float, base: str, interval: float, timeout: float) -> tuple[list[dict], dict]:
+    """Poll with a cursor, and count what the read lane did not serve.
+
+    `?since=X&limit=N` returns the newest N records above X, not the next N. So whenever
+    more than N arrive between two polls the middle is dropped silently: the reply carries
+    no error and `count` is a full N either way. The only signal is `first_seq`, which is
+    then greater than `since + 1`. Confirmed by measurement and by the service maintainers
+    (flop-labs/technocore-sonnet-challenge#9).
+    """
     by_seq: dict[int, dict] = {}
     seed = fetch(f"{base}/r/{room}?format=json&limit=200", timeout)
     cursor = seed["last_seq"]
@@ -118,20 +178,36 @@ def collect(room: str, seconds: float, base: str, interval: float, timeout: floa
         by_seq[m["seq"]] = m
     started = time.monotonic()
     polls = 0
+    skipped = 0
+    gaps: list[int] = []
     while time.monotonic() - started < seconds:
         d = fetch(f"{base}/r/{room}?format=json&limit=200&since={cursor}&n={polls}", timeout)
         polls += 1
-        if d["messages"]:
+        if d.get("count"):
+            if d["first_seq"] > cursor + 1:
+                missed = d["first_seq"] - (cursor + 1)
+                skipped += missed
+                gaps.append(missed)
             for m in d["messages"]:
                 by_seq[m["seq"]] = m
             cursor = max(cursor, d["last_seq"])
-        print(f"\r  collected {len(by_seq)} messages ({polls} polls)", end="", file=sys.stderr)
+        print(f"\r  collected {len(by_seq)} messages ({polls} polls, {skipped} skipped)",
+              end="", file=sys.stderr)
         time.sleep(interval)
     print(file=sys.stderr)
-    return [by_seq[s] for s in sorted(by_seq)]
+    msgs = [by_seq[s] for s in sorted(by_seq)]
+    return msgs, {
+        "mode": "poll",
+        "polls": polls,
+        "polls_with_a_gap": len(gaps),
+        "skipped": skipped,
+        "largest_gap": max(gaps, default=0),
+        # A poll run is a census only when it demonstrably lost nothing.
+        "proven_complete": skipped == 0,
+    }
 
 
-def analyse(room: str, msgs: list[dict]) -> dict[str, Any]:
+def analyse(room: str, msgs: list[dict], coverage: dict | None = None) -> dict[str, Any]:
     results = [verify(room, m) for m in msgs]
     reasons = Counter(r for _, r in results)
     signed = [m for m, (ok, _) in zip(msgs, results) if ok]
@@ -149,12 +225,33 @@ def analyse(room: str, msgs: list[dict]) -> dict[str, Any]:
     swept = sum(1 for m in msgs if isinstance(m.get("text"), str)
                 and m["text"] != single_line_sweep(m["text"]))
 
+    # Does a key that never comes back behave differently from one that does? Post count
+    # alone cannot say -- a one-shot key and a quiet regular look identical in one window.
+    # Text reuse can: count how much of each class's traffic is drawn from the small pool of
+    # strings the room repeats. CANNED_MIN is a threshold, not a discovery; it is stated here
+    # so the number can be recomputed against a different one.
+    by_key: dict[str, list[dict]] = {}
+    for m in signed:
+        by_key.setdefault(m["from"], []).append(m)
+    signed_texts = Counter(m.get("text", "") for m in signed)
+    canned = {t for t, c in signed_texts.items() if c >= CANNED_MIN}
+
+    def canned_share(predicate) -> dict[str, Any]:
+        group = [m for m in signed if predicate(len(by_key[m["from"]]))]
+        hits = sum(1 for m in group if m.get("text", "") in canned)
+        return {
+            "messages": len(group),
+            "on_a_repeated_text": hits,
+            "pct": round(100 * hits / len(group), 1) if group else 0.0,
+        }
+
     seq_lo, seq_hi = msgs[0]["seq"], msgs[-1]["seq"]
     span = seq_hi - seq_lo + 1
     secs = (_ts(msgs[-1]) - _ts(msgs[0])) or 1.0
 
     return {
         "room": room,
+        "coverage": coverage or {"mode": "unknown", "proven_complete": False},
         "captured": len(msgs),
         "seq_range": [seq_lo, seq_hi],
         "seq_span": span,
@@ -171,6 +268,12 @@ def analyse(room: str, msgs: list[dict]) -> dict[str, Any]:
         "unique_texts": len(texts),
         "duplicate_text_pct": round(100 * (1 - len(texts) / len(msgs)), 1),
         "top_texts": texts.most_common(10),
+        "repeated_texts": len(canned),
+        "repeated_text_threshold": CANNED_MIN,
+        "templating_by_key_class": {
+            "keys_posting_once": canned_share(lambda n: n == 1),
+            "keys_posting_more": canned_share(lambda n: n > 1),
+        },
         "nonce_digit_classes": dict(sorted(nonce_digits.items())),
         "text_contains_own_did": self_did,
         "text_altered_by_sweep": swept,
@@ -216,8 +319,10 @@ def compare(cap_a: dict, cap_b: dict) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Sample a Technocore room and verify every signature offline.")
-    p.add_argument("room", nargs="?", help="room to sample (omit when using --compare)")
-    p.add_argument("--seconds", type=float, default=120.0, help="how long to sample")
+    p.add_argument("room", nargs="?", help="room to read (omit when using --compare)")
+    p.add_argument("--poll", action="store_true",
+                   help="poll with a cursor instead of taking the whole retained ring")
+    p.add_argument("--seconds", type=float, default=120.0, help="how long to poll for")
     p.add_argument("--interval", type=float, default=1.3, help="seconds between polls")
     p.add_argument("--timeout", type=float, default=20.0)
     p.add_argument("--base-url", default=DEFAULT_BASE)
@@ -237,16 +342,23 @@ def main(argv: list[str] | None = None) -> int:
     if not a.room:
         p.error("a room is required unless --compare is used")
 
+    base = a.base_url.rstrip("/")
     try:
-        msgs = collect(a.room, a.seconds, a.base_url.rstrip("/"), a.interval, a.timeout)
+        if a.poll:
+            msgs, coverage = collect(a.room, a.seconds, base, a.interval, a.timeout)
+        else:
+            msgs, coverage = census(a.room, base, a.timeout)
     except RuntimeError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     if not msgs:
         print("error: captured nothing", file=sys.stderr)
         return 1
+    if not coverage.get("proven_complete"):
+        print(f"warning: {coverage.get('skipped', '?')} records were not served; "
+              "per-key statistics below understate how often keys post.", file=sys.stderr)
 
-    report = analyse(a.room, msgs)
+    report = analyse(a.room, msgs, coverage)
     if a.json:
         with open(a.json, "w", encoding="utf-8") as f:
             json.dump({"report": report, "messages": msgs}, f, ensure_ascii=False, indent=1)
