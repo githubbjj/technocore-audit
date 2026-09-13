@@ -23,6 +23,9 @@ count and text reuse are measuring the same thing from two sides, and text reuse
 that survives a short window: a single window cannot tell a one-shot key from a quiet
 regular, but it can tell a written message from a recited one.
 
+The two-window measurement moved even further. Across a 22,018-sequence separation the
+first report found 8.4% of keys returning; the same separation today gives **60.3%**.
+
 ## What changed in the method, and why it matters
 
 The first report polled `?since=<cursor>&limit=200` in a loop and reported "coverage of
@@ -117,18 +120,46 @@ different one. And a repeated string is not proof of anything on its own — a h
 legitimately repetitive. The claim here is only about the *difference* between the two
 classes, which is what a shared-cause explanation has to account for.
 
-### Persistence over four minutes
+### Keys come back now. Eight days ago they did not
 
-Taking a second census four minutes later gives 4,542 messages strictly after the first
-window, from 4,058 signing keys. **2,067 of them (50.9%) had already posted** in the
-thirteen minutes before.
+The first report's headline measurement needs two windows separated by a gap, because one
+window cannot tell a one-shot key from a quiet regular. Repeating it on complete censuses:
 
-That is an *adjacent* pair, not a separated one, so it is not comparable to the first
-report's 8.4% across a 22,018-sequence gap — it measures persistence over minutes rather
-than survival over a longer interval, and the honest reading is only that half of the
-keys active in any given minute were already active in the preceding quarter hour. A
-separated pair needs two captures far enough apart that the ring has fully turned over;
-the tool's `--compare` does that arithmetic once both exist.
+| | window A | window B |
+|---|---|---|
+| UTC | 17:37:21 – 17:55:28 | 18:02:27 – 18:27:40 |
+| sequences | 45,684,829 – 45,705,956 | 45,715,528 – 45,745,569 |
+| signed messages | 21,022 | 29,528 |
+| distinct keys | 13,491 | 16,105 |
+
+Both contiguous, disjoint, separated by 9,572 sequences and 7.0 minutes.
+
+**7,840 of window B's 16,105 keys — 48.7% — had already posted in window A.** On
+2026-09-04 the same measurement gave 8.4%.
+
+Because the two gaps are not the same size, window B is also cut by distance from A's end,
+which makes the comparison direct and shows the shape:
+
+| separation from A | minutes later | keys | also in A | |
+|---|---|---:|---:|---:|
+| 6,001 – 12,000 | 8.9 | 2,103 | 1,382 | **65.7%** |
+| 12,001 – 20,000 | 16.3 | 6,800 | 4,354 | **64.0%** |
+| 20,001 – 32,000 | 25.8 | 9,069 | 5,472 | **60.3%** |
+| 32,001 – 60,000 | 32.5 | 6,730 | 4,042 | **60.1%** |
+
+The first report measured across 22,018 sequences and got 8.4%. The equivalent bucket here
+is 60.3%. And the curve is nearly flat — 3.5x more separation costs 5.6 points — which is
+what a population of regulars looks like, not a churn of disposable keys.
+
+Two cautions on reading that as a clean 8.4 → 60. The old figure came through the lossy
+read lane described above, which understates reappearance, so part of the gap is
+measurement. And the population genuinely changed: a contest drew thousands of persistent
+agents onto the service during the week between. Neither explains a seven-fold move on its
+own, and this report cannot apportion them.
+
+What does survive both cautions is the shape. A room where 60% of the keys active in any
+half hour were already active in the preceding twenty minutes is not the room the first
+report described, whatever its exact number should have been.
 
 ### Still a live hazard: 19-digit nonces
 
