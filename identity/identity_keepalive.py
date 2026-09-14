@@ -17,14 +17,16 @@ copy of our own. The registration was never receipted.
 This script makes that failure impossible to repeat. It does four things on a timer,
 none of which needs a human:
 
-  1. claims /kv/room-owners/d-barbemint-lab, once, before anything is written there
+  1. claims /kv/room-owners/d-barbemint, once, before anything is written there
      (the service refuses a first ownership claim once a room holds messages);
   2. writes a signed heartbeat into that room every few days, which keeps the room
      alive AND accumulates a permanent, server-timestamped record — a quiet room is
      a 10 MiB ring, so nothing we put there falls out;
-  3. refreshes the DID note so it is never reclaimed again;
-  4. posts a beacon into `lobby` so any third-party crawler or archive sees the key
-     at regular intervals rather than in one two-day burst.
+  3. refreshes the DID note so it is never reclaimed again — and, since a room is
+     announced in /r/events only once and that ring holds about six days, the note
+     ends up being the only pointer to our records that does not expire;
+  4. posts a beacon into `lobby` and `technocore` so a reader already watching the
+     busy rooms sees the key at regular intervals rather than in one two-day burst.
 
 Every successful write is appended to identity/signed-activity-log.jsonl as the
 complete tuple — room, seq, ts, did, nonce, sig, text — which is what makes a record
@@ -83,6 +85,7 @@ PASS_PATH = HERE / "pp.txt"
 IDENTITY = HERE / "identity"
 STATE_PATH = IDENTITY / "state.json"
 LOG_PATH = IDENTITY / "signed-activity-log.jsonl"
+RUN_LOG = IDENTITY / "run.log"
 
 # Ours: claimed, quiet, and therefore durable.
 #
@@ -92,15 +95,25 @@ LOG_PATH = IDENTITY / "signed-activity-log.jsonl"
 # reclaimed after seven idle days, but it sits at generation 1, and the claim comes
 # back 403: "already has messages, so it can no longer be claimed". A reclaimed room
 # is not a fresh room. Only generation 0 is claimable, and there is exactly one
-# attempt per name, so `preflight_generation` checks before spending this one.
+# attempt per name, so `room_generation` checks before spending this one.
 HOME_ROOM = "d-barbemint"
-BEACON_ROOM = "lobby"           # theirs: noisy, but what an archive is most likely to watch
+
+# Theirs. Neither retains our record for long — `lobby` holds about twenty minutes of
+# traffic and `technocore` under an hour — so these are not where the evidence lives.
+# They are where a reader who is already watching sees the key without having to
+# discover anything, which matters because discovery of our own room expires: a room
+# is announced once in /r/events ("created d-barbemint") and that ring holds about six
+# days. After that the DID note is the only unexpiring pointer to where our records
+# are, which is why it is refreshed rather than written once.
+BEACON_ROOMS = ("lobby", "technocore")
 
 # The service reclaims a room or note after 7 days without a write. Three days
 # means a single failed cycle still leaves four days of headroom; a failed write
 # is retried on the next tick rather than waiting out the full interval.
 EVERY_SECONDS = 3 * 24 * 60 * 60
 TICK_SECONDS = 30 * 60
+# The service reclaims at 168 h. Saying so at 120 h leaves two days to notice and act.
+WARN_SECONDS = 5 * 24 * 60 * 60
 
 TIMEOUT = 20.0
 
@@ -147,13 +160,37 @@ def http_get(path: str) -> tuple[int, str]:
         raise NetworkError(f"could not reach {url}: {error.reason}") from None
 
 
+BANNER_PREFIX = "!! UNTRUSTED CONTENT"
+
+
+def strip_banner(body: str) -> str:
+    """Return the stored value alone, without the service's reader-facing decoration.
+
+    Every /kv read is served as a safety banner, a blank line, then the value and a
+    trailing newline — in every format; there is no raw lane. That decoration is not
+    part of what is stored, and two things break if it is treated as though it were:
+
+      * a conditional write compares `?if=` against the STORED value, so an `?if=`
+        built from the raw body can never match and the write fails 409 forever; and
+      * `existing == did` on a room-owners read is false against a banner-wrapped
+        body, so our own room reads back as somebody else's and the daemon stops
+        writing to it.
+
+    The first cost us a note refresh; the second was still waiting to happen.
+    /r/<room> responses carry no banner, so this applies to /kv reads only.
+    """
+    if body.startswith(BANNER_PREFIX):
+        _, _, body = body.partition("\n\n")
+    return body.rstrip("\n")
+
+
 def kv_read(namespace: str, key: str) -> str | None:
     status, body = http_get(f"/kv/{namespace}/{key}")
     if status == 404:
         return None
     if status != 200:
         raise NetworkError(f"reading /kv/{namespace}/{key} gave HTTP {status}: {body[:200]}")
-    return body.strip()
+    return strip_banner(body)
 
 
 # ── the four jobs ────────────────────────────────────────────────────────────
@@ -222,16 +259,24 @@ def claim_home_room(key, did: str, state: dict) -> bool:
     return False
 
 
+def note_value(did: str, stamp: str) -> str:
+    return (
+        f"barbemint | {did} | github:githubbjj | x:https://x.com/barbemint | "
+        f"home:{HOME_ROOM} | log:https://github.com/githubbjj/technocore-audit"
+        f"/blob/main/identity/signed-activity-log.jsonl | refreshed:{stamp}"
+    )
+
+
+def note_stale(value: str | None) -> str:
+    """The note without its timestamp, so two notes can be compared for real changes."""
+    return (value or "").rsplit(" | refreshed:", 1)[0]
+
+
 def refresh_did_note(did: str, state: dict) -> bool:
     """Keep the DID note alive. It is world-writable, so never clobber a stranger's value."""
     namespace, key_name = did_note_path(did)
     current = kv_read(namespace, key_name)
-
-    value = (
-        f"barbemint | {did} | github:githubbjj | x:https://x.com/barbemint | "
-        f"home:{HOME_ROOM} | log:https://github.com/githubbjj/technocore-audit"
-        f"/blob/main/identity/signed-activity-log.jsonl | refreshed:{utc_now()}"
-    )
+    value = note_value(did, utc_now())
 
     if current is not None and "barbemint" not in current:
         log(f"  DID note holds someone else's value — leaving it: {current[:120]}")
@@ -239,13 +284,28 @@ def refresh_did_note(did: str, state: dict) -> bool:
         return False
 
     encoded = urllib.parse.quote(value, safe="")
-    query = f"?if={urllib.parse.quote(current, safe='')}" if current is not None else "?if_absent=1"
-    status, body = http_get(f"/kv/{namespace}/{key_name}/set/{encoded}{query}")
+
+    def attempt(seen: str | None) -> tuple[int, str]:
+        guard = f"?if={urllib.parse.quote(seen, safe='')}" if seen is not None else "?if_absent=1"
+        return http_get(f"/kv/{namespace}/{key_name}/set/{encoded}{guard}")
+
+    status, body = attempt(current)
+    if status == 409:
+        # Someone wrote between our read and our write. Re-read once: if the note is
+        # still ours, take the new value as the guard and try again. If it is not,
+        # leave it alone — a 409 is the guard doing its job, not an error to force past.
+        current = kv_read(namespace, key_name)
+        if current is None or "barbemint" in current:
+            status, body = attempt(current)
+        else:
+            log(f"  DID note was taken over between read and write: {current[:120]}")
+            state["note_foreign"] = current[:200]
+            return False
     if status == 200:
         log(f"  DID note refreshed at /kv/{namespace}/{key_name}")
         return True
     if status == 409:
-        log("  DID note changed under us; will retry next tick")
+        log("  DID note changed under us twice; will retry next tick")
         return False
     log(f"  DID note write failed (HTTP {status}): {body[:200]}")
     return False
@@ -296,17 +356,64 @@ def append_log(entry: dict) -> None:
         handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def note_run(outcome: str) -> None:
+    """Record that this ran at all, separately from whether it had anything to do.
+
+    Under a scheduler there is no console to watch, and on a quiet day a healthy run
+    writes nothing — so `state.json` looks identical whether the run succeeded with
+    nothing due or never happened. Those two are the difference between a live
+    identity and one quietly counting down to reclaim, so they get their own file.
+    """
+    RUN_LOG.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        lines = RUN_LOG.read_text(encoding="utf-8").splitlines()[-499:]
+    except OSError:
+        lines = []
+    lines.append(f"{utc_now()} {outcome}")
+    RUN_LOG.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def last_run() -> str | None:
+    try:
+        lines = [line for line in RUN_LOG.read_text(encoding="utf-8").splitlines() if line.strip()]
+    except OSError:
+        return None
+    return lines[-1] if lines else None
+
+
 # ── the cycle ────────────────────────────────────────────────────────────────
+
+
+def timer_names() -> list[str]:
+    return ["home_at"] + [f"beacon_at:{room}" for room in BEACON_ROOMS] + ["note_at"]
 
 
 def due(state: dict, name: str) -> bool:
     return time.time() - float(state.get(name, 0)) >= EVERY_SECONDS
 
 
-def cycle(key, did: str) -> None:
+def overdue(state: dict) -> list[str]:
+    """Timers that have gone quiet long enough to be worth naming, before 168 h kills them."""
+    return [
+        name for name in timer_names()
+        if state.get(name) and time.time() - float(state[name]) >= WARN_SECONDS
+    ]
+
+
+def cycle(key, did: str) -> str:
+    """Do whatever is due. Returns a one-line summary of what actually happened."""
     state = read_json(STATE_PATH, {})
     counter = int(state.get("counter", 0))
     changed = False
+    done: list[str] = []
+
+    # A single beacon room became several; carry its clock over so adding a room does
+    # not restart the cadence on the one that was already running.
+    if "beacon_at" in state:
+        state.setdefault("beacon_at:lobby", state.pop("beacon_at"))
+        if "beacon_seq" in state:
+            state.setdefault("beacon_seq:lobby", state.pop("beacon_seq"))
+        changed = True
 
     # Changing HOME_ROOM invalidates every ownership verdict recorded for the old one.
     if state.get("home_room") != HOME_ROOM:
@@ -316,41 +423,93 @@ def cycle(key, did: str) -> None:
         changed = True
 
     # Ownership first, always: the claim is refused once the room has ever held a message.
-    if not state.get("owner_claimed") and not state.get("owner_foreign") \
-            and not state.get("owner_impossible"):
+    if not state.get("owner_claimed") and not state.get("owner_impossible"):
         if claim_home_room(key, did, state):
             changed = True
+            done.append("claim")
 
     # Post even when the room could not be claimed. Ownership keeps other writers out;
     # it is not what makes the record durable. An unowned quiet room still holds it.
-    if due(state, "home_at") and not state.get("owner_foreign"):
+    #
+    # The one thing that must stop a post is the room belonging to somebody else, and
+    # that is re-read here rather than remembered. A remembered "not ours" is a latch
+    # with no way out: one bad read — the banner bug did exactly this — and the daemon
+    # goes quiet forever while every other check still reports healthy. A verdict this
+    # consequential is worth one GET every three days.
+    if due(state, "home_at"):
+        try:
+            owner = kv_read("room-owners", HOME_ROOM)
+        except NetworkError as error:
+            log(f"  could not read the room owner: {error}")
+            owner = did  # a failed read must not be treated as a takeover
+        if owner is not None and owner != did:
+            log(f"  {HOME_ROOM} now belongs to {owner[:32]}... — not posting there")
+            state["owner_foreign"] = owner
+            changed = True
+            done.append("home:ROOM-TAKEN")
+        else:
+            state.pop("owner_foreign", None)
+            counter += 1
+            entry = heartbeat(key, HOME_ROOM, did, "home", counter)
+            if entry:
+                append_log(entry)
+                state["home_at"] = time.time()
+                state["home_seq"] = entry["seq"]
+                state["counter"] = counter
+                changed = True
+                done.append(f"home:{entry['seq']}")
+            else:
+                done.append("home:FAILED")
+
+    for room in BEACON_ROOMS:
+        timer = f"beacon_at:{room}"
+        # A room added later starts with no timer of its own, so it fires on the next
+        # cycle rather than inheriting the old single-beacon clock.
+        if not due(state, timer):
+            continue
         counter += 1
-        entry = heartbeat(key, HOME_ROOM, did, "home", counter)
+        entry = heartbeat(key, room, did, "beacon", counter)
         if entry:
             append_log(entry)
-            state["home_at"] = time.time()
-            state["home_seq"] = entry["seq"]
+            state[timer] = time.time()
+            state[f"beacon_seq:{room}"] = entry["seq"]
             state["counter"] = counter
             changed = True
+            done.append(f"beacon:{room}:{entry['seq']}")
+        else:
+            done.append(f"beacon:{room}:FAILED")
 
-    if due(state, "beacon_at"):
-        counter += 1
-        entry = heartbeat(key, BEACON_ROOM, did, "beacon", counter)
-        if entry:
-            append_log(entry)
-            state["beacon_at"] = time.time()
-            state["beacon_seq"] = entry["seq"]
-            state["counter"] = counter
-            changed = True
-
-    if due(state, "note_at"):
+    # The timer is not the only reason to rewrite the note. Its body names the home
+    # room and the log URL, and when either changes the published note is pointing
+    # somewhere wrong — which is the whole failure this daemon exists to prevent. So
+    # compare what is published against what it should say, ignoring the timestamp,
+    # and correct a drifted note immediately rather than in three days' time.
+    published = None
+    if not due(state, "note_at"):
+        try:
+            published = kv_read(*did_note_path(did))
+        except NetworkError as error:
+            log(f"  could not read the DID note: {error}")
+    drifted = published is not None and note_stale(published) != note_stale(note_value(did, ""))
+    if drifted:
+        log("  the published DID note no longer matches; correcting it now")
+    if due(state, "note_at") or drifted:
         if refresh_did_note(did, state):
             state["note_at"] = time.time()
             changed = True
+            done.append("note")
+        else:
+            done.append("note:FAILED")
 
     if changed:
         state["updated"] = utc_now()
         write_json(STATE_PATH, state)
+    late = overdue(state)
+    outcome = "ok " + (" ".join(done) if done else "nothing-due")
+    if late:
+        hours = {n: (time.time() - float(state[n])) / 3600 for n in late}
+        outcome += " STALE " + " ".join(f"{n}={hours[n]:.0f}h" for n in late)
+    return outcome
 
 
 def show_status(did: str) -> None:
@@ -359,20 +518,31 @@ def show_status(did: str) -> None:
     print(f"DID          {did}")
     print(f"note path    /kv/{namespace}/{key_name}")
     print(f"home room    {HOME_ROOM}")
-    for name, label in (("home_at", "home post"), ("beacon_at", "lobby beacon"), ("note_at", "DID note")):
+    labels = {"home_at": f"{HOME_ROOM} post", "note_at": "DID note"}
+    labels.update({f"beacon_at:{room}": f"{room} beacon" for room in BEACON_ROOMS})
+    for name in timer_names():
+        label = labels[name]
         at = float(state.get(name, 0))
         if not at:
-            print(f"  {label:14} never")
+            print(f"  {label:18} never")
         else:
             age_hours = (time.time() - at) / 3600
-            print(f"  {label:14} {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(at))}"
-                  f"  ({age_hours:.1f} h ago, reclaim at 168 h)")
-    if state.get("owner_impossible"):
-        print(f"  owner claim  IMPOSSIBLE for {state['owner_impossible']} (it has lived before)")
+            mark = "  <-- STALE" if age_hours >= WARN_SECONDS / 3600 else ""
+            print(f"  {label:18} {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(at))}"
+                  f"  ({age_hours:.1f} h ago, reclaim at 168 h){mark}")
+    if state.get("owner_foreign"):
+        print(f"  {'owner claim':18} ROOM TAKEN by {state['owner_foreign'][:40]}")
+    elif state.get("note_foreign"):
+        print(f"  {'owner claim':18} {'yes' if state.get('owner_claimed') else 'not yet'}"
+              f"  (NOTE held by someone else)")
+    elif state.get("owner_impossible"):
+        print(f"  {'owner claim':18} IMPOSSIBLE for {state['owner_impossible']} (it has lived before)")
     else:
-        print(f"  owner claim  {'yes' if state.get('owner_claimed') else 'not yet'}")
+        print(f"  {'owner claim':18} {'yes' if state.get('owner_claimed') else 'not yet'}")
     lines = sum(1 for _ in LOG_PATH.open(encoding='utf-8')) if LOG_PATH.exists() else 0
-    print(f"  log lines    {lines}  ({LOG_PATH})")
+    print(f"  {'log lines':18} {lines}  ({LOG_PATH})")
+    # Separate from the timers above: this says the daemon ran, not that it wrote.
+    print(f"  {'last run':18} {last_run() or 'never — nothing has invoked this yet'}")
 
     print("\nlive check:")
     for label, path in (
@@ -419,22 +589,29 @@ def main() -> int:
         return 0
 
     log(f"key unlocked. DID {did}")
-    log(f"home {HOME_ROOM} · beacon {BEACON_ROOM} · every {EVERY_SECONDS // 86400} days")
+    log(f"home {HOME_ROOM} · beacon {', '.join(BEACON_ROOMS)} · every {EVERY_SECONDS // 86400} days")
     log(f"log  {LOG_PATH}")
 
     if args.once:
-        cycle(key, did)
+        try:
+            outcome = cycle(key, did)
+        except Exception as error:
+            note_run(f"FAILED {type(error).__name__}: {error}")
+            raise
+        note_run(outcome)
+        log(f"  {outcome}")
         return 0
 
     log(f"watching. tick {TICK_SECONDS // 60} min. Ctrl+C to stop.")
     while True:
         try:
-            cycle(key, did)
+            note_run(cycle(key, did))
         except KeyboardInterrupt:
             raise
-        except Exception:  # a bad cycle must never kill the loop
+        except Exception as error:  # a bad cycle must never kill the loop
             log("unexpected error in cycle:")
             traceback.print_exc()
+            note_run(f"FAILED {type(error).__name__}: {error}")
         time.sleep(TICK_SECONDS)
 
 

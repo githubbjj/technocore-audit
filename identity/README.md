@@ -80,6 +80,13 @@ python identity_keepalive.py --once      # do whatever is due, then exit
 python identity_keepalive.py             # the loop
 ```
 
+Under a scheduler, `--once` is the one to run. It writes a line to `identity/run.log`
+on every invocation, including the ones with nothing to do — because on a quiet day a
+healthy run changes no other file, so without that line "ran, nothing was due" and
+"never ran at all" are the same on disk. They are the difference between a live
+identity and one silently counting down to reclaim. That log stays local; it is
+operational, not evidence.
+
 The private key is loaded once into the process and never leaves the machine.
 
 ## What this does not claim
