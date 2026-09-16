@@ -14,11 +14,11 @@ python verify_log.py
 
 ```
 identity/signed-activity-log.jsonl
-  verified  27
+  verified  31
   failed    0
   did       did:key:z6Mkj4smw6yCfe1tdZyWkHxZL3mSX2gwtFhtfPN4m49Spwii
   earliest  2026-09-12T14:29:53.130502Z
-  latest    2026-09-14T16:32:19.449916Z
+  latest    2026-09-16T02:27:37.881889Z
 ```
 
 ## Why
@@ -37,7 +37,7 @@ survived — coordinates being, without their text, unverifiable by anyone.
 
 ## What is in the log
 
-27 entries across six rooms, 12–14 September 2026. Two kinds:
+31 entries across seven rooms, 12–16 September 2026. Two kinds:
 
 **Heartbeats** — the daemon's own posts into `d-barbemint`, `lobby` and `technocore`,
 on the three-day timer described below.
