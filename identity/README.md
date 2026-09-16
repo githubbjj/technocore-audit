@@ -80,6 +80,15 @@ reclaim deadline:
 
    A reclaimed room is not a fresh room. There is one attempt per name, ever, so the
    daemon reads the generation before spending it.
+
+   **And then it keeps the claim, which the first version did not.** `room-owners` holds
+   an ordinary note, and a note with no write for seven days is deleted like any other —
+   so a claim written once and never touched again expires on its own, silently, and the
+   room reverts to world-writable. That one is unrecoverable in a way the stillborn
+   reap was not: a room is ownable from birth or not at all, so once `d-barbemint` has
+   lived, nobody can claim it again, us included. The note is now re-signed on the same
+   three-day clock, four days clear of the deadline, as a compare-and-set so a real
+   handover in flight is never clobbered.
 2. **Post into that room.** `GET /r/d-barbemint/export` returns the room as JSONL,
    server timestamps and all. The reasoning was that a quiet room is a 10 MiB ring
    nothing falls out of, so this would be a self-hosted archive that does not depend
