@@ -107,13 +107,48 @@ HOME_ROOM = "d-barbemint"
 # are, which is why it is refreshed rather than written once.
 BEACON_ROOMS = ("lobby", "technocore")
 
-# The service reclaims a room or note after 7 days without a write. Three days
-# means a single failed cycle still leaves four days of headroom; a failed write
-# is retried on the next tick rather than waiting out the full interval.
-EVERY_SECONDS = 3 * 24 * 60 * 60
+# A mailbox others can write to. `mb-` refuses the unsigned lane, so every message
+# that lands is attributable to a did:key; the `p-` class keeps the name out of
+# /rooms, so it is reachable only from the DID note that advertises it. The name is
+# the whole secret: if it is ever flooded, mint a new one and the note republishes it.
+MAILBOX_ROOM = "mb-p-bm8f4fb1692c17b7b6"
+
+# A room still holding its FIRST message is reclaimed after `stillborn_seconds` —
+# 43200 on this deployment, twelve hours — while a room past that lives on the seven-day
+# idle rule instead. Any heartbeat slower than twelve hours therefore cannot keep a room
+# alive one line at a time: every post creates the room, sits alone in it, and is reaped
+# long before the next one. That is not a theory. `d-barbemint` was claimed and written at
+# 2026-09-13T06:02:00Z and read back `count: 0` thirty-three hours later, and the same
+# thing had already happened once before that.
+#
+# Two messages is the whole fix: at two the stillborn rule no longer applies. So every
+# cycle checks the count and tops the room up, which also repairs a room that was reaped
+# while nobody was looking.
+MIN_ROOM_MESSAGES = 2
+
+# The service accepts a nonce of 1-19 digits and refuses anything longer.
+MAX_NONCE_DIGITS = 19
+
+# The service reclaims a room or note after 7 days without a write.
+RECLAIM_SECONDS = 7 * 24 * 60 * 60
+
+# Survival only needs a write inside that window, and three days did that. But the
+# archive is the point: an eligibility check reads what a public room's ring actually
+# retained, and `lobby` rotates its 10 MiB ring in roughly a quarter of an hour. Whether
+# any one beacon is still there when someone looks is luck; the only lever we hold is how
+# many times we roll the dice. A daily cycle triples the attempts for four writes a day —
+# nothing against a 300/min limit — and still leaves six days of headroom after a failure.
+EVERY_SECONDS = 24 * 60 * 60
+# How early a timer may fire. See due() — the scheduler tick and the cadence are both
+# daily, so a slack that is too small lets them race and the cadence loses. Twelve hours
+# is the widest slack that still cannot double-post: two scheduler ticks are always a full
+# day apart, so only a manual re-run inside the same half-day could land twice, and that
+# is exactly the case the timer exists to suppress.
+DUE_SLACK_SECONDS = 12 * 60 * 60
 TICK_SECONDS = 30 * 60
-# The service reclaims at 168 h. Saying so at 120 h leaves two days to notice and act.
-WARN_SECONDS = 5 * 24 * 60 * 60
+# At a daily cycle a timer this old means three cycles in a row did not write, which is
+# already abnormal. Saying so at 72 h leaves four days to notice and act.
+WARN_SECONDS = 3 * 24 * 60 * 60
 
 TIMEOUT = 20.0
 
@@ -207,6 +242,74 @@ def room_generation(room: str) -> int | None:
         return None
 
 
+def retained_at_least(room: str, want: int) -> int | None:
+    """min(messages the room holds, `want`). None if it could not be read.
+
+    `count` is the size of THIS reply, not of the room: asked with `limit=1` it reads 1
+    for a room holding a thousand. Reading it as a room total made the floor check below
+    always see one message and post an anchor on every single run — a write per cycle,
+    forever, while never actually testing the thing it was there to test.
+
+    So ask for exactly the floor. The answer saturates at `want`, which is all the caller
+    needs and the smallest reply that can carry it; `limit` is advisory and clamped to
+    1..200, so a floor inside that range is answered exactly.
+    """
+    want = max(1, min(int(want), 200))
+    status, body = http_get(f"/r/{room}?format=json&limit={want}")
+    if status != 200:
+        return None
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    # Prefer the messages actually delivered over the summary field: `count` is the
+    # server's word for the same thing, but the list is the thing itself.
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        return len(messages)
+    try:
+        return int(payload.get("count", -1))
+    except (TypeError, ValueError):
+        return None
+
+
+def keep_room_alive(key, did: str, room: str, kind: str, counter: int,
+                    done: list) -> tuple[int, bool]:
+    """Top a room up to MIN_ROOM_MESSAGES so the stillborn reaper cannot take it.
+
+    Runs every cycle, not only when the heartbeat is due: the point is to notice a room
+    that is already gone.
+
+    It clears the floor in ONE invocation rather than a message per run. A single post
+    into an empty room leaves it holding exactly one message — still stillborn, still
+    reaped twelve hours later, long before a daily run could add the second. Topping up
+    one at a time would reproduce the original bug with more steps.
+
+    The posts are bounded by the floor, and the first failure stops the rest: if the
+    service is refusing writes, sending the same request again in the same run only
+    spends the write budget on the same refusal.
+    """
+    count = retained_at_least(room, MIN_ROOM_MESSAGES)
+    if count is None:
+        log(f"  could not read the message count of {room}; leaving it alone")
+        return counter, False
+    if count >= MIN_ROOM_MESSAGES:
+        return counter, False
+
+    log(f"  {room} holds {count} message(s), below the floor of {MIN_ROOM_MESSAGES}; anchoring")
+    posted_any = False
+    for _ in range(MIN_ROOM_MESSAGES - count):
+        counter += 1
+        entry, reason = heartbeat(key, room, did, kind, counter)
+        if not entry:
+            done.append(f"anchor:{room}:FAILED({reason})")
+            break
+        append_log(entry)
+        done.append(f"anchor:{room}:{entry['seq']}")
+        posted_any = True
+    return counter, posted_any
+
+
 def claim_home_room(key, did: str, state: dict) -> bool:
     """Claim ownership of the home room. There is one attempt per room name, ever.
 
@@ -259,10 +362,109 @@ def claim_home_room(key, did: str, state: dict) -> bool:
     return False
 
 
+def ownership_nonce() -> int | None:
+    """A nonce the ownership namespace will accept.
+
+    `room-owners` and `room-allow` share `/kv/room-nonce/<room>` as one replay counter,
+    and a signed note write must exceed whatever is in it. A wall clock is normally
+    already past it, but not necessarily — the counter is whatever the last accepted
+    write put there — so take the larger of the two rather than assuming.
+
+    Both sides are parsed rather than trusted to be numbers. `next_nonce()` hands back
+    digits as a string, and comparing that to an int raises instead of picking a nonce;
+    the counter comes off the wire and could be anything at all.
+    """
+    def digits(value, default=None):
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            return default
+
+    clock = digits(next_nonce(), default=int(time.time() * 1000))
+    try:
+        stored = digits(kv_read("room-nonce", HOME_ROOM))
+    except NetworkError as error:
+        log(f"  could not read the ownership nonce ({error}); using the clock")
+        stored = None
+    chosen = clock if stored is None else max(clock, stored + 1)
+
+    # The service takes 1-19 digits. A counter already at the ceiling makes every
+    # successor too long, and the request would be refused for a reason the log would
+    # not name. Only our own accepted writes can move this counter, so reaching it means
+    # something wrote a nonsense nonce — worth saying out loud rather than sending a
+    # request that cannot be accepted.
+    if not 1 <= len(str(chosen)) <= MAX_NONCE_DIGITS:
+        log(f"  cannot build a legal nonce: {chosen} is not 1-{MAX_NONCE_DIGITS} digits "
+            f"(shared counter reads {stored})")
+        return None
+    return chosen
+
+
+def refresh_room_ownership(key, did: str, state: dict) -> bool:
+    """Rewrite the ownership note so the reaper never collects it.
+
+    The claim was written once and then left alone, which was a mistake: `room-owners`
+    holds an ordinary note, and a note with no write for seven days is deleted like any
+    other. Nothing warns you — the room simply stops being owned.
+
+    That is not a loss you can undo. A room is ownable from birth or not at all, so once
+    `d-barbemint` has lived the claim cannot be re-made by us or by anyone; the room would
+    fall back to world-writable for good, and a stranger could then flood the ring the
+    archive lives in. Refreshing on the daily heartbeat keeps it six days clear of
+    the deadline.
+
+    Writing the same DID over our own claim is the handover operation pointed back at
+    ourselves, which is what the service documents for this namespace, and `?if=` makes it
+    a compare-and-set so a genuine handover in flight is not clobbered.
+    """
+    try:
+        current = kv_read("room-owners", HOME_ROOM)
+    except NetworkError as error:
+        log(f"  could not read the ownership note ({error}); leaving it alone")
+        return False
+
+    if current is not None and current != did:
+        log(f"  {HOME_ROOM} is owned by {current[:24]}... — not touching it")
+        state["owner_foreign"] = current
+        state["owner_claimed"] = False
+        return False
+
+    if current is None:
+        # Either it was never claimed, or the reaper has already taken it. claim_home_room
+        # tells the two apart and refuses to spend the attempt on a room that has lived.
+        log(f"  the ownership note for {HOME_ROOM} is GONE — trying to re-establish it")
+        state["owner_claimed"] = False
+        return claim_home_room(key, did, state)
+
+    nonce = ownership_nonce()
+    if nonce is None:
+        return False
+    signature = sign_bytes(key, f"room-owners|{HOME_ROOM}|{nonce}|{did}".encode("utf-8"))
+    path = (
+        f"/kv/room-owners/{HOME_ROOM}/set-signed/{did}/{signature}/{nonce}/"
+        f"{urllib.parse.quote(did, safe='')}"
+        f"?if={urllib.parse.quote(current, safe='')}"
+    )
+    status, body = http_get(path)
+    if status == 200:
+        log(f"  ownership note for {HOME_ROOM} refreshed")
+        state["owner_claimed"] = True
+        state["owner_refreshed_at"] = utc_now()
+        return True
+    if status == 409:
+        # Someone else's write landed between the read and this one. Their value is in
+        # the body; the next cycle re-reads and decides on it rather than fighting.
+        log(f"  ownership note changed under us: {body[:160]}")
+        return False
+    log(f"  ownership refresh failed (HTTP {status}): {body[:200]}")
+    return False
+
+
 def note_value(did: str, stamp: str) -> str:
     return (
         f"barbemint | {did} | github:githubbjj | x:https://x.com/barbemint | "
-        f"home:{HOME_ROOM} | log:https://github.com/githubbjj/technocore-audit"
+        f"home:{HOME_ROOM} | mailbox:{MAILBOX_ROOM} | "
+        f"log:https://github.com/githubbjj/technocore-audit"
         f"/blob/main/identity/signed-activity-log.jsonl | refreshed:{stamp}"
     )
 
@@ -311,8 +513,22 @@ def refresh_did_note(did: str, state: dict) -> bool:
     return False
 
 
-def heartbeat(key, room: str, did: str, kind: str, counter: int) -> dict | None:
-    """Post one signed line and return the full re-verifiable tuple, or None."""
+def failure_reason(error: Exception) -> str:
+    """One short line naming why a post failed, safe to put in run.log.
+
+    run.log is the only record a scheduled run leaves behind: the scheduler discards
+    stdout, so `log()` output is gone the moment the process exits. Recording just
+    "FAILED" made `beacon:lobby` fail on three of five days with no way to tell a
+    timeout from a refusal — five days of the same fault, undiagnosable. The reason
+    is collapsed onto one line and clipped, because a traceback in a log meant to be
+    skimmed is the same as no log at all.
+    """
+    text = " ".join(f"{type(error).__name__}: {error}".split())
+    return text[:117] + "..." if len(text) > 120 else text
+
+
+def heartbeat(key, room: str, did: str, kind: str, counter: int) -> tuple[dict | None, str]:
+    """Post one signed line. Returns (tuple, "") or (None, reason)."""
     # The counter and timestamp are not decoration: a room refuses a text that has
     # already been posted too many times in the last few seconds (422), and the check
     # folds case, whitespace and Unicode compatibility — so every line must differ.
@@ -332,8 +548,9 @@ def heartbeat(key, room: str, did: str, kind: str, counter: int) -> dict | None:
     try:
         response = post_signed_message(key, room, text, timeout=TIMEOUT)
     except (NetworkError, ProtocolError, IdentityError) as error:
-        log(f"  {kind} post to {room} failed: {error}")
-        return None
+        reason = failure_reason(error)
+        log(f"  {kind} post to {room} failed: {reason}")
+        return None, reason
     posted = response.get("posted", {})
     entry = {
         "room": room,
@@ -346,7 +563,7 @@ def heartbeat(key, room: str, did: str, kind: str, counter: int) -> dict | None:
         "kind": kind,
     }
     log(f"  {kind} -> {room} seq {entry['seq']} @ {entry['ts']}")
-    return entry
+    return entry, ""
 
 
 def append_log(entry: dict) -> None:
@@ -385,15 +602,28 @@ def last_run() -> str | None:
 
 
 def timer_names() -> list[str]:
-    return ["home_at"] + [f"beacon_at:{room}" for room in BEACON_ROOMS] + ["note_at"]
+    return (["home_at"] + [f"beacon_at:{room}" for room in BEACON_ROOMS]
+            + ["note_at", "owner_at"])
 
 
 def due(state: dict, name: str) -> bool:
-    return time.time() - float(state.get(name, 0)) >= EVERY_SECONDS
+    # Fire early, on purpose. Nothing runs this as a 30-minute loop in practice; run.log
+    # shows one invocation a day from the Windows scheduler, nominally at 00:00Z. Two ways
+    # that tick misses an exact 24 h threshold, both seen in run.log:
+    #
+    #   - seconds: the tick lands a few seconds before the moment yesterday's write
+    #     finished, reads 23:59:5x, and returns False (09-19 would have been skipped).
+    #   - hours: the PC is off at 00:00, the scheduler runs the missed start on boot
+    #     (09-26 ran at 05:12Z), and the next 00:00 tick is only 18.8 h later, so that
+    #     day writes nothing at all (09-27 logged `nothing-due`).
+    #
+    # One hour of slack covered the first and not the second. Twelve covers both: any
+    # boot time up to noon still leaves the next midnight tick past the threshold.
+    return time.time() - float(state.get(name, 0)) >= EVERY_SECONDS - DUE_SLACK_SECONDS
 
 
 def overdue(state: dict) -> list[str]:
-    """Timers that have gone quiet long enough to be worth naming, before 168 h kills them."""
+    """Timers quiet long enough to be worth naming, before RECLAIM_SECONDS kills them."""
     return [
         name for name in timer_names()
         if state.get(name) and time.time() - float(state[name]) >= WARN_SECONDS
@@ -428,6 +658,18 @@ def cycle(key, did: str) -> str:
             changed = True
             done.append("claim")
 
+    # And then keep it. The claim is a note, and a note nobody writes to for seven days is
+    # deleted — after which this room can never be owned again by anyone, because it has
+    # lived. On the same daily clock as everything else, which leaves six days of slack.
+    if (state.get("owner_claimed") and not state.get("owner_impossible")
+            and not state.get("owner_foreign") and due(state, "owner_at")):
+        if refresh_room_ownership(key, did, state):
+            state["owner_at"] = time.time()
+            changed = True
+            done.append("owner")
+        else:
+            done.append("owner:FAILED")
+
     # Post even when the room could not be claimed. Ownership keeps other writers out;
     # it is not what makes the record durable. An unowned quiet room still holds it.
     #
@@ -435,7 +677,7 @@ def cycle(key, did: str) -> str:
     # that is re-read here rather than remembered. A remembered "not ours" is a latch
     # with no way out: one bad read — the banner bug did exactly this — and the daemon
     # goes quiet forever while every other check still reports healthy. A verdict this
-    # consequential is worth one GET every three days.
+    # consequential is worth one GET a day.
     if due(state, "home_at"):
         try:
             owner = kv_read("room-owners", HOME_ROOM)
@@ -450,7 +692,7 @@ def cycle(key, did: str) -> str:
         else:
             state.pop("owner_foreign", None)
             counter += 1
-            entry = heartbeat(key, HOME_ROOM, did, "home", counter)
+            entry, reason = heartbeat(key, HOME_ROOM, did, "home", counter)
             if entry:
                 append_log(entry)
                 state["home_at"] = time.time()
@@ -459,7 +701,21 @@ def cycle(key, did: str) -> str:
                 changed = True
                 done.append(f"home:{entry['seq']}")
             else:
-                done.append("home:FAILED")
+                done.append(f"home:FAILED({reason})")
+
+    # Whether or not the heartbeat was due, make sure the two rooms this identity owns
+    # the meaning of are above the stillborn floor. The home room is the archive; the
+    # mailbox has to be there before anyone writes to it, or a stranger's first message
+    # lands alone in a fresh room and is reaped with it twelve hours later.
+    if not state.get("owner_foreign"):
+        counter, posted = keep_room_alive(key, did, HOME_ROOM, "anchor", counter, done)
+        if posted:
+            state["counter"] = counter
+            changed = True
+    counter, posted = keep_room_alive(key, did, MAILBOX_ROOM, "mailbox", counter, done)
+    if posted:
+        state["counter"] = counter
+        changed = True
 
     for room in BEACON_ROOMS:
         timer = f"beacon_at:{room}"
@@ -468,7 +724,7 @@ def cycle(key, did: str) -> str:
         if not due(state, timer):
             continue
         counter += 1
-        entry = heartbeat(key, room, did, "beacon", counter)
+        entry, reason = heartbeat(key, room, did, "beacon", counter)
         if entry:
             append_log(entry)
             state[timer] = time.time()
@@ -477,13 +733,13 @@ def cycle(key, did: str) -> str:
             changed = True
             done.append(f"beacon:{room}:{entry['seq']}")
         else:
-            done.append(f"beacon:{room}:FAILED")
+            done.append(f"beacon:{room}:FAILED({reason})")
 
     # The timer is not the only reason to rewrite the note. Its body names the home
     # room and the log URL, and when either changes the published note is pointing
     # somewhere wrong — which is the whole failure this daemon exists to prevent. So
     # compare what is published against what it should say, ignoring the timestamp,
-    # and correct a drifted note immediately rather than in three days' time.
+    # and correct a drifted note immediately rather than a day later.
     published = None
     if not due(state, "note_at"):
         try:
@@ -518,7 +774,9 @@ def show_status(did: str) -> None:
     print(f"DID          {did}")
     print(f"note path    /kv/{namespace}/{key_name}")
     print(f"home room    {HOME_ROOM}")
-    labels = {"home_at": f"{HOME_ROOM} post", "note_at": "DID note"}
+    print(f"mailbox      {MAILBOX_ROOM}")
+    labels = {"home_at": f"{HOME_ROOM} post", "note_at": "DID note",
+              "owner_at": "ownership note"}
     labels.update({f"beacon_at:{room}": f"{room} beacon" for room in BEACON_ROOMS})
     for name in timer_names():
         label = labels[name]
@@ -529,7 +787,7 @@ def show_status(did: str) -> None:
             age_hours = (time.time() - at) / 3600
             mark = "  <-- STALE" if age_hours >= WARN_SECONDS / 3600 else ""
             print(f"  {label:18} {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(at))}"
-                  f"  ({age_hours:.1f} h ago, reclaim at 168 h){mark}")
+                  f"  ({age_hours:.1f} h ago, reclaim at {RECLAIM_SECONDS // 3600} h){mark}")
     if state.get("owner_foreign"):
         print(f"  {'owner claim':18} ROOM TAKEN by {state['owner_foreign'][:40]}")
     elif state.get("note_foreign"):
@@ -545,15 +803,36 @@ def show_status(did: str) -> None:
     print(f"  {'last run':18} {last_run() or 'never — nothing has invoked this yet'}")
 
     print("\nlive check:")
-    for label, path in (
-        ("DID note", f"/kv/{namespace}/{key_name}"),
-        ("room owner", f"/kv/room-owners/{HOME_ROOM}"),
+    # Read these the way the daemon reads them — through kv_read, which strips the
+    # `!! UNTRUSTED CONTENT` banner every /kv reply carries. Printing the raw body put
+    # the banner in the 110 characters this line has room for and pushed the value
+    # itself off the end, so the one screen a human checks to confirm the note is
+    # correct could not show the note. The banner already cost us a 409 once, by being
+    # compared instead of stripped; here it cost the diagnostic its whole point.
+    for label, ns, key in (
+        ("DID note", namespace, key_name),
+        ("room owner", "room-owners", HOME_ROOM),
     ):
         try:
-            status, body = http_get(path)
-            print(f"  {label:11} HTTP {status}  {body.strip()[:110]}")
+            value = kv_read(ns, key)
+            print(f"  {label:11} {'(absent)' if value is None else value.strip()[:110]}")
         except NetworkError as error:
             print(f"  {label:11} {error}")
+    # The message count, not just the generation: a room at or below the stillborn floor
+    # is one the reaper will take within twelve hours, however healthy everything else
+    # looks. This is the number that was silently wrong for two days.
+    # retained_at_least() asks for exactly MIN_ROOM_MESSAGES rows, so on a healthy room
+    # the answer is capped at the floor. Print it as ">= 2", not "2", or a room holding
+    # thirteen messages reads as if it were sitting on the edge.
+    for label, room in (("home", HOME_ROOM), ("mailbox", MAILBOX_ROOM)):
+        count = retained_at_least(room, MIN_ROOM_MESSAGES)
+        if count is None:
+            print(f"  {label + ' msgs':11} unreadable")
+        elif count >= MIN_ROOM_MESSAGES:
+            print(f"  {label + ' msgs':11} >= {MIN_ROOM_MESSAGES}  (at or above the stillborn floor)")
+        else:
+            print(f"  {label + ' msgs':11} {count}"
+                  f"  <-- BELOW THE STILLBORN FLOOR ({MIN_ROOM_MESSAGES}); reaped within 12 h")
     generation = room_generation(HOME_ROOM)
     verdict = {0: "never born — claimable", None: "unreadable"}.get(
         generation, "has lived — can never be owned"
@@ -589,7 +868,7 @@ def main() -> int:
         return 0
 
     log(f"key unlocked. DID {did}")
-    log(f"home {HOME_ROOM} · beacon {', '.join(BEACON_ROOMS)} · every {EVERY_SECONDS // 86400} days")
+    log(f"home {HOME_ROOM} · beacon {', '.join(BEACON_ROOMS)} · every {EVERY_SECONDS // 3600} h")
     log(f"log  {LOG_PATH}")
 
     if args.once:
