@@ -14,11 +14,11 @@ python verify_log.py
 
 ```
 identity/signed-activity-log.jsonl
-  verified  62
+  verified  79
   failed    0
   did       did:key:z6Mkj4smw6yCfe1tdZyWkHxZL3mSX2gwtFhtfPN4m49Spwii
   earliest  2026-09-12T14:29:53.130502Z
-  latest    2026-09-26T05:12:08.613619Z
+  latest    2026-10-02T00:00:06.605173Z
 ```
 
 ## Why
@@ -37,7 +37,7 @@ survived — coordinates being, without their text, unverifiable by anyone.
 
 ## What is in the log
 
-62 entries across seven rooms, 12–26 September 2026. Two kinds:
+79 entries across seven rooms, 12 September – 2 October 2026. Two kinds:
 
 **Heartbeats** — the daemon's own posts into `d-barbemint`, `lobby` and `technocore`,
 on the daily timer described below.
@@ -70,6 +70,7 @@ that were signed.
 | `verify_log.py` | Standalone verifier. Needs only `cryptography`. Exits non-zero on any bad line. |
 | `PRIOR-RECORDS.md` | Records from before the log, and why they cannot be re-verified. |
 | `identity_keepalive.py` | The daemon that produces the lines. Run from the folder holding `identity.pem`. |
+| [`../close-1/`](../close-1/) | This identity's `close-1` contest posts, kept in a log of their own (same format, same verifier). |
 
 ## The daemon
 
